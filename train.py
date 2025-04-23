@@ -10,18 +10,27 @@ from tqdm import tqdm
 
 # ---------- hyper-parameters ----------
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE   = 32
+
+if DEVICE == "cpu":
+    print("Warning: running on CPU, which is slow")
+    print("Please use GPU for training.")
+    exit(1)
+
+BATCH_SIZE   = 128
 BUFFER_CAP   = 100_000
 GAMMA        = 0.99
 LR           = 1e-4
 TARGET_UPD   = 10_000        # steps
 EPS_START    = 1.0
 EPS_END      = 0.05
-EPS_DECAY    = 1e5           # steps
-TOTAL_STEPS  = 500_000
+EPS_DECAY    = 8e5           # steps
+TOTAL_STEPS  = 2_000_000
 SAVE_EVERY   = 100_000
 WEIGHT_PATH  = "mario_dqn.pth"
 # --------------------------------------
+
+# Open log file
+log_file = open("log.txt", "w")
 
 # ==== util ====
 import cv2
@@ -121,15 +130,21 @@ for step in pbar:
         frame = preprocess(obs)
         for _ in range(4): state_q.append(frame)
         state = stack_state(state_q)
+
+        # log
+        log_file.write(f"Episode {episode} | Reward: {total_reward}\n")
+        log_file.flush()
+
         episode += 1
         pbar.set_description(f"Ep {episode}")
         pbar.set_postfix(reward=total_reward, refresh=False)
         total_reward = 0
 
     # checkpoint
-    if step % SAVE_EVERY == 0:
+    if step % SAVE_EVERY == 0 and step > 0:
         torch.save(policy.state_dict(), WEIGHT_PATH)
         print(f"Saved checkpoint at {step} steps")
 
 torch.save(policy.state_dict(), WEIGHT_PATH)
+log_file.close()
 print("Training complete → mario_dqn.pth saved")
