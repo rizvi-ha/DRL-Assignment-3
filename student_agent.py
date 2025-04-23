@@ -7,17 +7,13 @@ from collections import deque
 # ------------------------------------------------------------
 # Utility: frame preprocessing
 # ------------------------------------------------------------
-try:
-    import cv2
+import cv2
 
-    def _preprocess_frame(frame: np.ndarray) -> np.ndarray:
-        """Convert RGB (240x256x3) frame to 84x84 grayscale uint8."""
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        frame = cv2.resize(frame, (84, 84), interpolation=cv2.INTER_AREA)
-        return frame
-except ImportError:  # fallback without cv2
-    print('oops')
-    exit(1)
+def _preprocess_frame(frame: np.ndarray) -> np.ndarray:
+    """Convert RGB (240x256x3) frame to 84x84 grayscale uint8."""
+    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    frame = cv2.resize(frame, (84, 84), interpolation=cv2.INTER_AREA)
+    return frame
 
 
 # ------------------------------------------------------------
@@ -40,8 +36,6 @@ class DQN(nn.Module):
         )
 
     def forward(self, x):
-        # Scale inputs to [0,1]
-        x = x / 255.0
         return self.net(x)
 
 
@@ -91,7 +85,7 @@ class Agent(object):
 
         # Build (4,84,84) tensor
         state = np.stack(self.frames, axis=0)  # uint8
-        state = torch.from_numpy(state).unsqueeze(0).to(self.device, dtype=torch.float32)
+        state = (torch.from_numpy(state).unsqueeze(0).to(self.device, dtype=torch.float32) / 255.0)
 
         with torch.no_grad():
             q_values = self.policy_net(state)
