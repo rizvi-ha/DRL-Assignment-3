@@ -24,14 +24,14 @@ if DEVICE.type == "cpu":
     exit(1)
 
 BATCH_SIZE   = 64
-BUFFER_CAP   = 100_000
+BUFFER_CAP   = 60_000
 GAMMA        = 0.9
 LR           = 2.5e-4
 TARGET_UPD   = 10_000       # steps between target network syncs
 EPS_START    = 1.0
-EPS_END      = 0.01
-EPS_DECAY    = 7_000_000    # linear decay steps
-TOTAL_STEPS  = 10_000_000
+EPS_END      = 0.05
+EPS_DECAY    = 3_000_000    # linear decay steps
+TOTAL_STEPS  = 5_000_000
 SAVE_EVERY   = 500_000
 WEIGHT_PATH  = "mario_dqn.pth"
 PRELOAD      = False
@@ -114,7 +114,6 @@ replay_buf = TensorDictReplayBuffer(
     storage=storage,
     batch_size=BATCH_SIZE,
     sampler=RandomSampler(),
-    device=DEVICE
 )
 
 # initialize
@@ -140,14 +139,13 @@ for step in progress:
     cum_reward += reward
 
     # push to GPU buffer as TensorDict
-    td = TensorDict({
-        "state":       torch.tensor(state, device=DEVICE, dtype=torch.float32).div_(255),
+    replay_buf.add(TensorDict({
+        "state":       torch.tensor(state, device=DEVICE, dtype=torch.uint8),
         "action":      torch.tensor(action, device=DEVICE, dtype=torch.long),
         "reward":      torch.tensor(reward, device=DEVICE, dtype=torch.float32),
-        "next_state":  torch.tensor(next_state, device=DEVICE, dtype=torch.float32).div_(255),
+        "next_state":  torch.tensor(next_state, device=DEVICE, dtype=torch.uint8),
         "done":        torch.tensor(done, device=DEVICE, dtype=torch.bool)
-    }, batch_size=[])
-    replay_buf.extend([td])
+    }, batch_size=[]))
     state = next_state
 
     # ε‑decay
@@ -156,10 +154,10 @@ for step in progress:
     # ---------- learn ----------
     if len(replay_buf) > WARMUP and step % 4 == 0:
         batch = replay_buf.sample()
-        s_batch = batch["state"]             # [B,4,84,84]
+        s_batch = batch["state"].float() / 255             # [B,4,84,84]
         a_batch = batch["action"].unsqueeze(-1)  # [B,1]
         r_batch = batch["reward"]            # [B]
-        n_batch = batch["next_state"]        # [B,4,84,84]
+        n_batch = batch["next_state"].float() / 255        # [B,4,84,84]
         d_batch = batch["done"].float()      # [B]
 
         # current Q
@@ -182,7 +180,7 @@ for step in progress:
 
     # ---------- episode end ----------
     if done:
-        log_f.write(f"Episode {episode}\tReward {cum_reward}\tEpsilon {eps:.3f}\n")
+        log_f.write(f"Episode {episode}\tReward {cum_reward}\tEpsilon {eps:.3f}\tSteps {step}\n")
         log_f.flush()
         episode += 1
         state = squeeze_obs(env.reset())
