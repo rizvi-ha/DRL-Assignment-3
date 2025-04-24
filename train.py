@@ -18,17 +18,18 @@ if DEVICE.type == "cpu":
     print("[train.py] FATAL: CUDA not available – training on CPU is far too slow.")
     exit(1)
 
-BATCH_SIZE   = 8192 
+BATCH_SIZE   = 4096 
 BUFFER_CAP   = 100_000
 GAMMA        = 0.99
-LR           = 1e-3
-TARGET_UPD   = 2_000        # steps between target network syncs
-EPS_START    = 1.0
+LR           = 1e-4
+TARGET_UPD   = 10_000        # steps between target network syncs
+EPS_START    = 0.6
 EPS_END      = 0.05
-EPS_DECAY    = 300_000     # linear decay steps
-TOTAL_STEPS  = 500_000
-SAVE_EVERY   = 10_000
-WEIGHT_PATH  = "mario_dqn.pth"
+EPS_DECAY    = 750_000     # linear decay steps
+TOTAL_STEPS  = 1_000_000
+SAVE_EVERY   = 100_000
+WEIGHT_PATH  = "mario_dqn_long.pth"
+PRELOAD      = True
 
 # ------------------------------------------------------------
 # Environment helper – handles grayscale, resize, framestack on the fly
@@ -73,7 +74,9 @@ class ReplayBuffer:
         self.size = min(self.size + 1, self.capacity)
 
     def sample(self, k):
-        idx = np.random.randint(0, self.size, size=k)
+        if k > self.size:
+            raise(ValueError, "Tried to sample before buffer populated")
+        idx = np.random.choice(self.size, size=k, replace=False)
         s  = torch.as_tensor(self.state[idx],      device=DEVICE, dtype=torch.uint8).float() / 255.
         n  = torch.as_tensor(self.next_state[idx], device=DEVICE, dtype=torch.uint8).float() / 255.
         a  = torch.as_tensor(self.action[idx],     device=DEVICE, dtype=torch.long)
@@ -110,6 +113,11 @@ env = make_env()
 n_actions = env.action_space.n
 
 policy_net = DQN(n_actions).to(DEVICE)
+if PRELOAD == True:
+    print("Loading previous weights")
+    pre_dict = torch.load("mario_dqn.pth", map_location=DEVICE)
+    policy_net.load_state_dict(pre_dict)
+
 target_net = DQN(n_actions).to(DEVICE)
 target_net.load_state_dict(policy_net.state_dict())
 
@@ -122,7 +130,6 @@ state = squeeze_obs(env.reset())  # (4,84,84)
 episode     = 0
 cum_reward  = 0
 log_f = open("log.txt", "w")
-curr_loss = []
 
 progress = tqdm(range(TOTAL_STEPS), desc="Training", miniters=100)
 for step in progress:
@@ -154,7 +161,6 @@ for step in progress:
             q_next = target_net(n_batch).max(1)[0]
             q_target = r_batch + GAMMA * q_next * (1 - d_batch)
         loss = nn.functional.smooth_l1_loss(q_pred, q_target)
-        curr_loss.append(loss)
         optimizer.zero_grad(); loss.backward(); optimizer.step()
 
     # ---------- target update ----------
@@ -163,12 +169,10 @@ for step in progress:
 
     # ---------- episode end ----------
     if done:
-        avg_loss = np.mean(curr_loss)
-        log_f.write(f"Episode {episode}\tReward {cum_reward}\tEpsilon {eps}\tAvg loss: {avg_loss}\n"); log_f.flush()
+        log_f.write(f"Episode {episode}\tReward {cum_reward}\tEpsilon {eps}\n"); log_f.flush()
         episode += 1
         state = squeeze_obs(env.reset())
         cum_reward = 0
-        curr_loss = []
 
     # ---------- checkpoint ----------
     if step % SAVE_EVERY == 0 and step > 0:
