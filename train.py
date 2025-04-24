@@ -18,37 +18,44 @@ if DEVICE.type == "cpu":
     print("[train.py] FATAL: CUDA not available – training on CPU is far too slow.")
     exit(1)
 
-BATCH_SIZE   = 4096 
-BUFFER_CAP   = 100_000
-GAMMA        = 0.99
+BATCH_SIZE   = 64 
+BUFFER_CAP   = 500_000
+GAMMA        = 0.9
 LR           = 1e-4
 TARGET_UPD   = 10_000        # steps between target network syncs
-EPS_START    = 0.6
-EPS_END      = 0.05
+EPS_START    = 1
+EPS_END      = 0.03
 EPS_DECAY    = 750_000     # linear decay steps
-TOTAL_STEPS  = 1_000_000
-SAVE_EVERY   = 100_000
-WEIGHT_PATH  = "mario_dqn_long.pth"
-PRELOAD      = True
+TOTAL_STEPS  = 10_000_000
+SAVE_EVERY   = 500_000
+WEIGHT_PATH  = "mario_dqn.pth"
+PRELOAD      = False
 
 # ------------------------------------------------------------
 # Environment helper – handles grayscale, resize, framestack on the fly
 # ------------------------------------------------------------
 
+class SkipFrame(gym.Wrapper):
+    def __init__(self, env, skip=4):
+        super().__init__(env); self._skip = skip
+
+    def step(self, action):
+        total_r = 0.0
+        for _ in range(self._skip):
+            obs, r, done, info = self.env.step(action)
+            total_r += r
+            if done: break
+        return obs, total_r, done, info
+
+
 def make_env():
     env = make_mario("SuperMarioBros-v0")
     env = JoypadSpace(env, COMPLEX_MOVEMENT)
-    env = GrayScaleObservation(env, keep_dim=True)  # (H,W,1)
+    env = SkipFrame(env, skip=4)                   # 4 frames per action
+    env = GrayScaleObservation(env, keep_dim=False)  # (H,W,1)
     env = ResizeObservation(env, 84)               # (84,84,1)
     env = FrameStack(env, 4)                       # (4,84,84,1)
     return env
-
-# utility to squeeze trailing channel‑dim if present
-def squeeze_obs(obs):
-    arr = np.array(obs, dtype=np.uint8)
-    if arr.ndim == 4 and arr.shape[-1] == 1:
-        arr = arr.squeeze(-1)  # -> (4,84,84)
-    return arr
 
 # ------------------------------------------------------------
 # Replay Buffer – contiguous arrays, no Python loops in sample
@@ -75,7 +82,8 @@ class ReplayBuffer:
 
     def sample(self, k):
         if k > self.size:
-            raise(ValueError, "Tried to sample before buffer populated")
+            print("Tried to sample before buffer populated")
+            exit(1)
         idx = np.random.choice(self.size, size=k, replace=False)
         s  = torch.as_tensor(self.state[idx],      device=DEVICE, dtype=torch.uint8).float() / 255.
         n  = torch.as_tensor(self.next_state[idx], device=DEVICE, dtype=torch.uint8).float() / 255.
@@ -103,7 +111,7 @@ class DQN(nn.Module):
         )
 
     def forward(self, x):
-        return self.net(x)
+        return nn.Softmax(dim=1)(self.net(x))
 
 # ------------------------------------------------------------
 # Main training loop
@@ -125,7 +133,7 @@ optimizer  = optim.Adam(policy_net.parameters(), lr=LR)
 replay_buf = ReplayBuffer(BUFFER_CAP)
 
 eps   = EPS_START
-state = squeeze_obs(env.reset())  # (4,84,84)
+state = env.reset()  # (4,84,84)
 
 episode     = 0
 cum_reward  = 0
@@ -144,7 +152,6 @@ for step in progress:
 
     # ---------- env step ----------
     next_state, reward, done, info = env.step(action)
-    next_state = squeeze_obs(next_state)
     cum_reward += reward
 
     replay_buf.push(state, action, reward, next_state, done)
@@ -154,14 +161,17 @@ for step in progress:
     eps = max(EPS_END, EPS_START - step / EPS_DECAY)
 
     # ---------- learn ----------
-    if len(replay_buf) > 20_000 and step % 4 == 0:
+    if len(replay_buf) > 2_000 and step % 4 == 0:
         s_batch, a_batch, r_batch, n_batch, d_batch = replay_buf.sample(BATCH_SIZE)
         q_pred = policy_net(s_batch).gather(1, a_batch.unsqueeze(1)).squeeze(1)
         with torch.no_grad():
             q_next = target_net(n_batch).max(1)[0]
             q_target = r_batch + GAMMA * q_next * (1 - d_batch)
         loss = nn.functional.smooth_l1_loss(q_pred, q_target)
-        optimizer.zero_grad(); loss.backward(); optimizer.step()
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_value_(policy_net.parameters(), 1)
+        optimizer.step()
 
     # ---------- target update ----------
     if step % TARGET_UPD == 0:
@@ -171,7 +181,7 @@ for step in progress:
     if done:
         log_f.write(f"Episode {episode}\tReward {cum_reward}\tEpsilon {eps}\n"); log_f.flush()
         episode += 1
-        state = squeeze_obs(env.reset())
+        state = env.reset()
         cum_reward = 0
 
     # ---------- checkpoint ----------
