@@ -3,12 +3,17 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from collections import deque
 from gym_super_mario_bros import make as make_mario
 from nes_py.wrappers import JoypadSpace
 from gym_super_mario_bros.actions import COMPLEX_MOVEMENT
 from gym.wrappers import GrayScaleObservation, ResizeObservation, FrameStack
 from tqdm import tqdm
+
+# TorchRL imports
+from tensordict import TensorDict
+from torchrl.data.replay_buffers import TensorDictReplayBuffer
+from torchrl.data.replay_buffers.storages import LazyTensorStorage
+from torchrl.data.replay_buffers.samplers import RandomSampler
 
 # ------------------------------------------------------------
 # Hyper‑parameters
@@ -18,33 +23,35 @@ if DEVICE.type == "cpu":
     print("[train.py] FATAL: CUDA not available – training on CPU is far too slow.")
     exit(1)
 
-BATCH_SIZE   = 64 
-BUFFER_CAP   = 500_000
+BATCH_SIZE   = 64
+BUFFER_CAP   = 100_000
 GAMMA        = 0.9
-LR           = 1e-4
-TARGET_UPD   = 10_000        # steps between target network syncs
-EPS_START    = 1
-EPS_END      = 0.03
-EPS_DECAY    = 750_000     # linear decay steps
+LR           = 2.5e-4
+TARGET_UPD   = 10_000       # steps between target network syncs
+EPS_START    = 1.0
+EPS_END      = 0.01
+EPS_DECAY    = 7_000_000    # linear decay steps
 TOTAL_STEPS  = 10_000_000
 SAVE_EVERY   = 500_000
 WEIGHT_PATH  = "mario_dqn.pth"
 PRELOAD      = False
+WARMUP       = 2000         # minimum buffer size before learning starts
 
 # ------------------------------------------------------------
-# Environment helper – handles grayscale, resize, framestack on the fly
+# Environment helper
 # ------------------------------------------------------------
-
 class SkipFrame(gym.Wrapper):
     def __init__(self, env, skip=4):
-        super().__init__(env); self._skip = skip
+        super().__init__(env)
+        self._skip = skip
 
     def step(self, action):
         total_r = 0.0
         for _ in range(self._skip):
             obs, r, done, info = self.env.step(action)
             total_r += r
-            if done: break
+            if done:
+                break
         return obs, total_r, done, info
 
 
@@ -57,50 +64,12 @@ def make_env():
     env = FrameStack(env, 4)                       # (4,84,84,1)
     return env
 
-# utility to squeeze trailing channel‑dim if present
+
 def squeeze_obs(obs):
     arr = np.array(obs, dtype=np.uint8)
     if arr.ndim == 4 and arr.shape[-1] == 1:
-        arr = arr.squeeze(-1)  # -> (4,84,84)
+        arr = arr.squeeze(-1)
     return arr
-
-# ------------------------------------------------------------
-# Replay Buffer – contiguous arrays, no Python loops in sample
-# ------------------------------------------------------------
-class ReplayBuffer:
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.size = 0
-        self.ptr = 0
-        self.state      = np.empty((capacity, 4, 84, 84), dtype=np.uint8)
-        self.action     = np.empty((capacity,),           dtype=np.int16)
-        self.reward     = np.empty((capacity,),           dtype=np.float32)
-        self.next_state = np.empty((capacity, 4, 84, 84), dtype=np.uint8)
-        self.done       = np.empty((capacity,),           dtype=np.bool_)
-
-    def push(self, s, a, r, n, d):
-        self.state[self.ptr]      = s
-        self.action[self.ptr]     = a
-        self.reward[self.ptr]     = r
-        self.next_state[self.ptr] = n
-        self.done[self.ptr]       = d
-        self.ptr  = (self.ptr + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
-
-    def sample(self, k):
-        if k > self.size:
-            print("Tried to sample before buffer populated")
-            exit(1)
-        idx = np.random.choice(self.size, size=k, replace=False)
-        s  = torch.as_tensor(self.state[idx],      device=DEVICE, dtype=torch.uint8).float() / 255.
-        n  = torch.as_tensor(self.next_state[idx], device=DEVICE, dtype=torch.uint8).float() / 255.
-        a  = torch.as_tensor(self.action[idx],     device=DEVICE, dtype=torch.long)
-        r  = torch.as_tensor(self.reward[idx],     device=DEVICE)
-        d  = torch.as_tensor(self.done[idx],       device=DEVICE).float()
-        return s, a, r, n, d
-
-    def __len__(self):
-        return self.size
 
 # ------------------------------------------------------------
 # DQN architecture
@@ -118,7 +87,7 @@ class DQN(nn.Module):
         )
 
     def forward(self, x):
-        return nn.Softmax(dim=1)(self.net(x))
+        return self.net(x)
 
 # ------------------------------------------------------------
 # Main training loop
@@ -128,66 +97,93 @@ env = make_env()
 n_actions = env.action_space.n
 
 policy_net = DQN(n_actions).to(DEVICE)
-if PRELOAD == True:
-    print("Loading previous weights")
-    pre_dict = torch.load("mario_dqn.pth", map_location=DEVICE)
-    policy_net.load_state_dict(pre_dict)
+if PRELOAD:
+    print("Loading previous weights from", WEIGHT_PATH)
+    policy_net.load_state_dict(torch.load(WEIGHT_PATH, map_location=DEVICE))
 
 target_net = DQN(n_actions).to(DEVICE)
 target_net.load_state_dict(policy_net.state_dict())
 
-optimizer  = optim.Adam(policy_net.parameters(), lr=LR)
-replay_buf = ReplayBuffer(BUFFER_CAP)
+def sync_target():
+    target_net.load_state_dict(policy_net.state_dict())
 
+optimizer  = optim.Adam(policy_net.parameters(), lr=LR)
+# GPU-based replay buffer
+storage = LazyTensorStorage(max_size=BUFFER_CAP, device=DEVICE)
+replay_buf = TensorDictReplayBuffer(
+    storage=storage,
+    batch_size=BATCH_SIZE,
+    sampler=RandomSampler(),
+    device=DEVICE
+)
+
+# initialize
 eps   = EPS_START
 state = squeeze_obs(env.reset())  # (4,84,84)
-
 episode     = 0
 cum_reward  = 0
 log_f = open("log.txt", "w")
-
 progress = tqdm(range(TOTAL_STEPS), desc="Training", miniters=100)
-for step in progress:
 
+for step in progress:
     # ---------- act ----------
-    if np.random.rand() < eps:
+    if torch.rand(1, device=DEVICE).item() < eps:
         action = env.action_space.sample()
     else:
         with torch.no_grad():
-            s = torch.as_tensor(state, device=DEVICE, dtype=torch.float32).unsqueeze(0) / 255.
+            s = torch.tensor(state, device=DEVICE, dtype=torch.float32).unsqueeze(0).div_(255)
             action = int(policy_net(s).argmax(1).item())
 
     # ---------- env step ----------
-    next_state, reward, done, info = env.step(action)
-    next_state = squeeze_obs(next_state)  # (4,84,84)
+    next_state, reward, done, _ = env.step(action)
+    next_state = squeeze_obs(next_state)
     cum_reward += reward
 
-    replay_buf.push(state, action, reward, next_state, done)
+    # push to GPU buffer as TensorDict
+    td = TensorDict({
+        "state":       torch.tensor(state, device=DEVICE, dtype=torch.float32).div_(255),
+        "action":      torch.tensor(action, device=DEVICE, dtype=torch.long),
+        "reward":      torch.tensor(reward, device=DEVICE, dtype=torch.float32),
+        "next_state":  torch.tensor(next_state, device=DEVICE, dtype=torch.float32).div_(255),
+        "done":        torch.tensor(done, device=DEVICE, dtype=torch.bool)
+    }, batch_size=[])
+    replay_buf.extend([td])
     state = next_state
 
     # ε‑decay
     eps = max(EPS_END, EPS_START - step / EPS_DECAY)
 
     # ---------- learn ----------
-    if len(replay_buf) > 2_000 and step % 4 == 0:
-        s_batch, a_batch, r_batch, n_batch, d_batch = replay_buf.sample(BATCH_SIZE)
-        q_pred = policy_net(s_batch).gather(1, a_batch.unsqueeze(1)).squeeze(1)
+    if len(replay_buf) > WARMUP and step % 4 == 0:
+        batch = replay_buf.sample()
+        s_batch = batch["state"]             # [B,4,84,84]
+        a_batch = batch["action"].unsqueeze(-1)  # [B,1]
+        r_batch = batch["reward"]            # [B]
+        n_batch = batch["next_state"]        # [B,4,84,84]
+        d_batch = batch["done"].float()      # [B]
+
+        # current Q
+        q_pred = policy_net(s_batch).gather(1, a_batch).squeeze(-1)
+        # double dqn target
         with torch.no_grad():
-            q_next = target_net(n_batch).max(1)[0]
-            q_target = r_batch + GAMMA * q_next * (1 - d_batch)
+            next_actions = policy_net(n_batch).argmax(1, keepdim=True)
+            q_next = target_net(n_batch).gather(1, next_actions).squeeze(-1)
+            q_target = r_batch + GAMMA * q_next * (1.0 - d_batch)
         loss = nn.functional.smooth_l1_loss(q_pred, q_target)
+
         optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_value_(policy_net.parameters(), 1)
+        nn.utils.clip_grad_value_(policy_net.parameters(), 1.0)
         optimizer.step()
 
     # ---------- target update ----------
     if step % TARGET_UPD == 0:
-        target_net.load_state_dict(policy_net.state_dict())
+        sync_target()
 
     # ---------- episode end ----------
     if done:
-        log_f.write(f"Episode {episode}\tReward {cum_reward}\tEpsilon {eps}\n"); log_f.flush()
+        log_f.write(f"Episode {episode}\tReward {cum_reward}\tEpsilon {eps:.3f}\n")
+        log_f.flush()
         episode += 1
         state = squeeze_obs(env.reset())
         cum_reward = 0
@@ -201,4 +197,3 @@ for step in progress:
 torch.save(policy_net.state_dict(), WEIGHT_PATH)
 log_f.close()
 print("[train.py] Training complete – weights saved to", WEIGHT_PATH)
-
