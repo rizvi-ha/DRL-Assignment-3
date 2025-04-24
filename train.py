@@ -57,6 +57,13 @@ def make_env():
     env = FrameStack(env, 4)                       # (4,84,84,1)
     return env
 
+# utility to squeeze trailing channel‑dim if present
+def squeeze_obs(obs):
+    arr = np.array(obs, dtype=np.uint8)
+    if arr.ndim == 4 and arr.shape[-1] == 1:
+        arr = arr.squeeze(-1)  # -> (4,84,84)
+    return arr
+
 # ------------------------------------------------------------
 # Replay Buffer – contiguous arrays, no Python loops in sample
 # ------------------------------------------------------------
@@ -133,7 +140,7 @@ optimizer  = optim.Adam(policy_net.parameters(), lr=LR)
 replay_buf = ReplayBuffer(BUFFER_CAP)
 
 eps   = EPS_START
-state = env.reset()  # (4,84,84)
+state = squeeze_obs(env.reset())  # (4,84,84)
 
 episode     = 0
 cum_reward  = 0
@@ -152,6 +159,7 @@ for step in progress:
 
     # ---------- env step ----------
     next_state, reward, done, info = env.step(action)
+    next_state = squeeze_obs(next_state)  # (4,84,84)
     cum_reward += reward
 
     replay_buf.push(state, action, reward, next_state, done)
@@ -181,7 +189,7 @@ for step in progress:
     if done:
         log_f.write(f"Episode {episode}\tReward {cum_reward}\tEpsilon {eps}\n"); log_f.flush()
         episode += 1
-        state = env.reset()
+        state = squeeze_obs(env.reset())
         cum_reward = 0
 
     # ---------- checkpoint ----------
