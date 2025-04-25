@@ -9,11 +9,11 @@ from collections import deque
 # ------------------------------------------------------------
 import cv2
 
-def _preprocess_frame(frame: np.ndarray) -> np.ndarray:
+def _preprocess_frame(frame: np.ndarray):
     """Convert RGB (240x256x3) frame to 84x84 grayscale uint8."""
     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
     frame = cv2.resize(frame, (84, 84), interpolation=cv2.INTER_AREA)
-    return frame
+    return frame 
 
 
 # ------------------------------------------------------------
@@ -51,6 +51,9 @@ class Agent(object):
         # Evaluation must run on CPU according to leaderboard rules
         self.device = torch.device("cpu")
 
+        self.skip_count = 0
+        self.last_action = 0
+
         # Action space has size 12 in COMPLEX_MOVEMENT
         self.action_space = gym.spaces.Discrete(12)
         n_actions = self.action_space.n
@@ -75,6 +78,10 @@ class Agent(object):
         if not self.use_network:
             return self.action_space.sample()
 
+        if self.skip_count > 0:
+            self.skip_count -= 1
+            return self.last_action
+
         # Preprocess incoming RGB frame
         processed = _preprocess_frame(observation)  # uint8 84×84
         self.frames.append(processed)
@@ -90,4 +97,8 @@ class Agent(object):
         with torch.no_grad():
             q_values = self.policy_net(state)
             action = int(q_values.argmax(dim=1).item())
+
+        self.last_action = action
+        self.skip_count = 4 - 1
+
         return action
