@@ -23,18 +23,18 @@ if DEVICE.type == "cpu":
     print("[train.py] FATAL: CUDA not available – training on CPU is far too slow.")
     exit(1)
 
-BATCH_SIZE   = 64
+BATCH_SIZE   = 128
 BUFFER_CAP   = 60_000
 GAMMA        = 0.9
-LR           = 2.5e-4
-TARGET_UPD   = 10_000       # steps between target network syncs
-EPS_START    = 1.0
-EPS_END      = 0.05
-EPS_DECAY    = 3_000_000    # linear decay steps
-TOTAL_STEPS  = 5_000_000
+LR           = 6e-5
+TARGET_UPD   = 15_000       # steps between target network syncs
+EPS_START    = 0.1
+EPS_END      = 0.001
+EPS_DECAY    = 1_500_000    # linear decay steps
+TOTAL_STEPS  = 2_000_000
 SAVE_EVERY   = 500_000
 WEIGHT_PATH  = "mario_dqn.pth"
-PRELOAD      = False
+PRELOAD      = True
 WARMUP       = 2000         # minimum buffer size before learning starts
 
 # ------------------------------------------------------------
@@ -149,7 +149,7 @@ for step in progress:
     state = next_state
 
     # ε‑decay
-    eps = max(EPS_END, EPS_START - step / EPS_DECAY)
+    eps = max(EPS_END, EPS_START - (step / EPS_DECAY)*(EPS_START-EPS_END))
 
     # ---------- learn ----------
     if len(replay_buf) > WARMUP and step % 4 == 0:
